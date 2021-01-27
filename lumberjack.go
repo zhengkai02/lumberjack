@@ -23,27 +23,34 @@ package lumberjack
 
 import (
 	"compress/gzip"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+
+	//"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"strconv"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 const (
-	backupTimeFormat = "2006-01-02T15-04-05.000"
-	compressSuffix   = ".gz"
-	defaultMaxSize   = 100
+	backupTimeFormat  = "2006-01-02T15-04-05.000"
 	normalTimeFormate = "2006-01-02 15-04-05.000"
 	DATEFORMAT        = "2006-01-02" //formate of date, used to rotate
 	LASTFILE          = "-LAST"      // flag of last file of today
+	compressSuffix    = ".gz"
+	defaultMaxSize    = 100
 )
+
+type PostRotateCallback func(args ...interface{}) ([]byte, error)
 
 // ensure we always implement io.WriteCloser
 var _ io.WriteCloser = (*Logger)(nil)
@@ -85,11 +92,14 @@ type Logger struct {
 	// in the same directory.  It uses <processname>-lumberjack.log in
 	// os.TempDir() if empty.
 	Filename string `json:"filename" yaml:"filename"`
-	Db       string `json:"db" yaml:"db"`
+	// Db is the db name
+	Db string `json:"db" yaml:"db"`
 	// Tb is the table name
 	Tb string `json:"tb" yaml:"tb"`
+
 	// MaxSize is the maximum size in megabytes of the log file before it gets
 	// rotated. It defaults to 100 megabytes.
+	//	MaxSize int `json:"maxsize" yaml:"maxsize"`
 	MaxSize string `json:"maxsize" yaml:"maxsize"`
 
 	// MaxAge is the maximum number of days to retain old log files based on the
@@ -97,29 +107,55 @@ type Logger struct {
 	// hours and may not exactly correspond to calendar days due to daylight
 	// savings, leap seconds, etc. The default is not to remove old log files
 	// based on age.
-	MaxAge int `json:"maxage" yaml:"maxage"`
+	//	MaxAge int `json:"maxage" yaml:"maxage"`
 
 	// MaxBackups is the maximum number of old log files to retain.  The default
 	// is to retain all old log files (though MaxAge may still cause them to get
 	// deleted.)
-	MaxBackups int `json:"maxbackups" yaml:"maxbackups"`
+	//	MaxBackups int `json:"maxbackups" yaml:"maxbackups"`
 
 	// LocalTime determines if the time used for formatting the timestamps in
 	// backup files is the computer's local time.  The default is to use UTC
 	// time.
-	LocalTime bool `json:"localtime" yaml:"localtime"`
+	//	LocalTime bool `json:"localtime" yaml:"localtime"`
 
 	// Compress determines if the rotated log files should be compressed
 	// using gzip. The default is not to perform compression.
-	Compress bool `json:"compress" yaml:"compress"`
+	//	Compress bool `json:"compress" yaml:"compress"`
+
+	// PostHandler is the handler after rotating of the file. Notify the remote server
+	// or some others to do something, such as transfer the file to the FILE-STORAGE-SYS.
+	PostHandler PostRotateCallback
+
+	// newFileName is the file be rotated. It is used by transfer server. For detail call liping_chang@intsig.net
+	//	newFileName string
+
+	postData struct {
+		// newFileName is the file be rotated. It is used by transfer server. For detail call liping_chang@intsig.net
+		newFileName string
+		// newFileSize is the file size be rotated. It is used by transfer server. For detail call liping_chang@intsig.net
+		newFileSize int64
+		// current database and table name
+		db, tb, date    string
+		idx             int
+		newFilePosBegin int64
+		newFilePosEnd   int64
+	}
+
 	// date the log file's date which is the start write date of the current.
 	date *time.Time
+	// last the last log file today or not.
+	//	last int32
+
+	// the file size that has writed
 	size int64
+	// file handler
 	file *os.File
 	mu   sync.Mutex
 
 	millCh    chan bool
 	startMill sync.Once
+
 	// the last rotate time
 	lastRotateTime time.Time
 }
@@ -139,6 +175,47 @@ var (
 	Gigabyte = 1024 * megabyte
 )
 
+var (
+	sqlStmt string = `
+		CREATE TABLE IF NOT EXISTS "t_binlog_file_status" (
+		"id"  INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+		"file_name"  TEXT NOT NULL,
+		"date"  TEXT NOT NULL,
+		"db"  TEXT NOT NULL,
+		"tb"  TEXT NOT NULL,
+		"idx"  INTEGER NOT NULL,
+		"create_time"  TEXT NOT NULL,
+		"modify_time"  TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS "idx_db_tb"
+		ON "t_binlog_file_status" ("db" ASC, "tb" ASC);
+		`
+	dbName string = "/dev/gobinlog2filesvr.db"
+)
+
+var (
+	db *sql.DB
+
+	err error
+)
+
+func init() {
+	defer func() {
+		if err := recover(); err != nil {
+			db.Close()
+		}
+	}()
+	// init sqlite3 db
+	db, err = sql.Open("sqlite3", dbName)
+	if err != nil {
+		panic(err)
+	}
+	_, err = db.Exec(sqlStmt)
+	if err != nil {
+		panic(fmt.Errorf("err: %v, sql: %s", err, sqlStmt))
+	}
+}
+
 // Write implements io.Writer.  If a write would cause the log file to be larger
 // than MaxSize, the file is closed, renamed to include a timestamp of the
 // current time, and a new log file is created using the original log file name.
@@ -148,10 +225,9 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	defer l.mu.Unlock()
 
 	writeLen := int64(len(p))
-	if writeLen > l.max() {
-		return 0, fmt.Errorf(
-			"write length %d exceeds maximum file size %d", writeLen, l.max(),
-		)
+	maxLen := l.max()
+	if writeLen > maxLen {
+		return 0, fmt.Errorf("write length %d exceeds maximum file size %d", writeLen, l.max())
 	}
 
 	if l.file == nil {
@@ -160,13 +236,31 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	if l.size+writeLen > l.max() {
+	if l.size+writeLen > maxLen {
+		//		log.Info("here Write")
 		if err := l.rotate(); err != nil {
 			return 0, err
 		}
 	}
 
-	n, err = l.file.Write(p)
+	//	if l.date != nil && getNowFormDate(DATEFORMAT).After(*l.date) {
+	//		atomic.StoreInt32(&l.last, 1)
+	//		if err := l.rotate(); err != nil {
+	//			return 0, err
+	//		}
+	//	}
+
+	//	writer := bufio.NewWriter(l.file)
+	//	if n, err :=writer.Write(p); err != nil {
+	//		return 0, err
+	//	}
+	//	writer.Flush()
+
+	if n, err = l.file.Write(p); err != nil {
+		return 0, err
+	}
+	l.file.Sync()
+
 	l.size += int64(n)
 
 	return n, err
@@ -204,6 +298,7 @@ func (l *Logger) Rotate() error {
 // (if it exists), opens a new file with the original filename, and then runs
 // post-rotation processing and removal.
 func (l *Logger) rotate() error {
+	//	log.Info("here rotate")
 	if err := l.close(); err != nil {
 		return err
 	}
@@ -214,10 +309,14 @@ func (l *Logger) rotate() error {
 	return nil
 }
 
+//func (l *Logger) SetPostHandler(h PostRotateCallback) {
+//	l.postHandler = h
+//}
+
 // openNew opens a new log file for writing, moving any old log file out of the
 // way.  This methods assumes the file has already been closed.
 func (l *Logger) openNew() error {
-	err := os.MkdirAll(l.dir(), 0744)
+	err := os.MkdirAll(l.dir(), 0755)
 	if err != nil {
 		return fmt.Errorf("can't make directories for new logfile: %s", err)
 	}
@@ -229,10 +328,21 @@ func (l *Logger) openNew() error {
 		// Copy the mode off the old logfile.
 		mode = info.Mode()
 		// move the existing file
-		newname := backupName(name, l.LocalTime)
+		//		newname := backupName(name, l.LocalTime, atomic.LoadInt32(&l.last))
+		newname, date, idx, err := backupNameUseIndex(l.Db, l.Tb, name)
+		if err != nil {
+			return err
+		}
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
+
+		l.postData.newFileName = newname
+		l.postData.newFileSize = info.Size()
+		l.postData.db = l.Db
+		l.postData.tb = l.Tb
+		l.postData.date = date
+		l.postData.idx = idx
 
 		// this is a no-op anywhere but linux
 		if err := chown(name, info); err != nil {
@@ -249,13 +359,15 @@ func (l *Logger) openNew() error {
 	}
 	l.file = f
 	l.size = 0
+	l.date = getNowFormDate(DATEFORMAT)
+	l.lastRotateTime = time.Now()
 	return nil
 }
 
 // backupName creates a new filename from the given name, inserting a timestamp
 // between the filename and the extension, using the local time if requested
-// (otherwise UTC).
-func backupName(name string, local bool) string {
+// (otherwise UTC), inserting last flag to identify the last log file if requested.
+func backupName(name string, local bool, last int32) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
 	ext := filepath.Ext(filename)
@@ -264,9 +376,73 @@ func backupName(name string, local bool) string {
 	if !local {
 		t = t.UTC()
 	}
+	if last > 0 {
+		ext = LASTFILE + ext
+	}
 
 	timestamp := t.Format(backupTimeFormat)
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+}
+
+// backupNameUseIndex creates a new filename from the given name, inserting a index
+// between the filename and the extension, index is the seq NO. of file,
+// padding zero if index length less than 4,
+// inserting last flag to identify the last log file if requested.
+// @retrun backupFileName, date, idx, error
+func backupNameUseIndex(db, tb, name string) (string, string, int, error) {
+	var (
+		index, dbIndex int
+		date, dbDate   string
+		last           int32
+	)
+	dir := filepath.Dir(name)
+	filename := filepath.Base(name)
+	ext := filepath.Ext(filename)
+	prefix := filename[:len(filename)-len(ext)]
+
+	// 使用sqlite获取name对应索引
+	meta, err := getFileMetaInfo(db, tb)
+	if err != nil {
+		index = 0
+		dbIndex = index + 1
+		if err == sql.ErrNoRows {
+			// 说明是第一个文件
+			date = currentTime().Format(DATEFORMAT)
+			dbDate = date
+			if err := insertFileMetaInfo(name, dbDate, dbIndex, db, tb); err != nil {
+				//				log.Printf("insert file: %s meta info to sqlite err: %v", filename, err)
+				return "", "", -1, fmt.Errorf("insert file: %s meta info to sqlite err: %v", filename, err)
+			}
+			return filepath.Join(dir, fmt.Sprintf("%s-%s-%04d%s", prefix, date, index, ext)), date, index, nil
+		} else {
+			// 说明数据表查询出错
+			//			log.Printf("get file: %s meta info from sqlite err: %v", filename, err)
+			return "", "", -1, fmt.Errorf("get file: %s meta info from sqlite err: %v", filename, err)
+		}
+	}
+
+	index = meta.index
+	date = meta.date
+
+	dbIndex = index + 1
+	dbDate = date
+
+	dateFormat, _ := time.Parse(DATEFORMAT, date)
+	if dateFormat.Before(*getNowFormDate(DATEFORMAT)) {
+		// 跨天，说明已经是当天最后一个文件
+		last = 1
+	}
+	if last >= 1 {
+		dbIndex = 0
+		dbDate = currentTime().Format(DATEFORMAT)
+		ext = (LASTFILE + ext)
+	}
+	if err := updateFileMetaInfo(dbDate, dbIndex, db, tb); err != nil {
+		//		log.Printf("update file: %s meta info to sqlite err: %v", filename, err)
+		return "", "", -1, fmt.Errorf("update file: %s meta info to sqlite err: %v", filename, err)
+	}
+
+	return filepath.Join(dir, fmt.Sprintf("%s-%s-%04d%s", prefix, date, index, ext)), date, index, nil
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
@@ -288,6 +464,11 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 		return l.rotate()
 	}
 
+	//	if now != nil && l.date != nil && now.After(*l.date) {
+	//		atomic.StoreInt32(&l.last, 1)
+	//		return l.rotate()
+	//	}
+
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		// if we fail to open the old log file for some reason, just ignore
@@ -296,6 +477,9 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	}
 	l.file = file
 	l.size = info.Size()
+	l.date = getNowFormDate(DATEFORMAT)
+	l.lastRotateTime = time.Now()
+	//	atomic.StoreInt32(&l.last, 0)
 	return nil
 }
 
@@ -312,73 +496,128 @@ func (l *Logger) filename() string {
 // Log files are compressed if enabled via configuration and old log
 // files are removed, keeping at most l.MaxBackups files, as long as
 // none of them are older than MaxAge.
-func (l *Logger) millRunOnce() error {
-	if l.MaxBackups == 0 && l.MaxAge == 0 && !l.Compress {
-		return nil
-	}
+//func (l *Logger) millRunOnce() error {
+//	if l.MaxBackups == 0 && l.MaxAge == 0 && !l.Compress {
+//		return nil
+//	}
 
-	files, err := l.oldLogFiles()
-	if err != nil {
-		return err
-	}
+//	files, err := l.oldLogFiles()
+//	if err != nil {
+//		return err
+//	}
 
-	var compress, remove []logInfo
+//	var compress, remove []logInfo
 
-	if l.MaxBackups > 0 && l.MaxBackups < len(files) {
-		preserved := make(map[string]bool)
-		var remaining []logInfo
-		for _, f := range files {
-			// Only count the uncompressed log file or the
-			// compressed log file, not both.
-			fn := f.Name()
-			if strings.HasSuffix(fn, compressSuffix) {
-				fn = fn[:len(fn)-len(compressSuffix)]
-			}
-			preserved[fn] = true
+//	if l.MaxBackups > 0 && l.MaxBackups < len(files) {
+//		preserved := make(map[string]bool)
+//		var remaining []logInfo
+//		for _, f := range files {
+//			// Only count the uncompressed log file or the
+//			// compressed log file, not both.
+//			fn := f.Name()
+//			if strings.HasSuffix(fn, compressSuffix) {
+//				fn = fn[:len(fn)-len(compressSuffix)]
+//			}
+//			preserved[fn] = true
 
-			if len(preserved) > l.MaxBackups {
-				remove = append(remove, f)
-			} else {
-				remaining = append(remaining, f)
-			}
+//			if len(preserved) > l.MaxBackups {
+//				remove = append(remove, f)
+//			} else {
+//				remaining = append(remaining, f)
+//			}
+//		}
+//		files = remaining
+//	}
+//	if l.MaxAge > 0 {
+//		diff := time.Duration(int64(24*time.Hour) * int64(l.MaxAge))
+//		cutoff := currentTime().Add(-1 * diff)
+
+//		var remaining []logInfo
+//		for _, f := range files {
+//			if f.timestamp.Before(cutoff) {
+//				remove = append(remove, f)
+//			} else {
+//				remaining = append(remaining, f)
+//			}
+//		}
+//		files = remaining
+//	}
+
+//	if l.Compress {
+//		for _, f := range files {
+//			if !strings.HasSuffix(f.Name(), compressSuffix) {
+//				compress = append(compress, f)
+//			}
+//		}
+//	}
+
+//	// newFileName assign re-again
+//	for _, f := range remove {
+//		fn := filepath.Join(l.dir(), f.Name())
+//		errRemove := os.Remove(fn)
+//		if err == nil && errRemove != nil {
+//			err = errRemove
+//		}
+//		if l.postData.newFileName == fn {
+//			l.postData.newFileName = ""
+//		}
+//	}
+//	for _, f := range compress {
+//		fn := filepath.Join(l.dir(), f.Name())
+//		errCompress := CompressLogFile(fn, fn+compressSuffix)
+//		if err == nil && errCompress != nil {
+//			err = errCompress
+//		}
+
+//		if err == nil {
+//			l.postData.newFileName = fn
+//		}
+//	}
+
+//	// call post handler if not nil
+//	if l.PostHandler != nil && l.postData.newFileName != "" &&
+//		(l.postData.newFileSize > 0 || strings.Contains(l.postData.newFileName, LASTFILE)) {
+//		//		log.Info("here")
+//		_, errPostHandler := l.PostHandler(l.postData.newFileName,
+//			l.postData.newFileSize, l.postData.db, l.postData.tb,
+//			l.postData.date)
+//		if err == nil && errPostHandler != nil {
+//			err = errPostHandler
+//		}
+
+//		l.postData.newFileName = ""
+//		l.postData.newFileSize = 0
+//		l.postData.db = ""
+//		l.postData.tb = ""
+//		l.postData.date = ""
+//		l.postData.idx = -1
+//		l.postData.newFilePosBegin = 0
+//		l.postData.newFilePosEnd = 0
+//	}
+
+//	return err
+//}
+
+func (l *Logger) millRunOnceV2() error {
+	// call post handler if not nil
+	if l.PostHandler != nil && l.postData.newFileName != "" &&
+		(l.postData.newFileSize > 0 || strings.Contains(l.postData.newFileName, LASTFILE)) {
+		//		log.Info("here")
+		_, errPostHandler := l.PostHandler(l.postData.newFileName,
+			l.postData.newFileSize, l.postData.db, l.postData.tb,
+			l.postData.date)
+		if err == nil && errPostHandler != nil {
+			err = errPostHandler
 		}
-		files = remaining
-	}
-	if l.MaxAge > 0 {
-		diff := time.Duration(int64(24*time.Hour) * int64(l.MaxAge))
-		cutoff := currentTime().Add(-1 * diff)
 
-		var remaining []logInfo
-		for _, f := range files {
-			if f.timestamp.Before(cutoff) {
-				remove = append(remove, f)
-			} else {
-				remaining = append(remaining, f)
-			}
-		}
-		files = remaining
-	}
-
-	if l.Compress {
-		for _, f := range files {
-			if !strings.HasSuffix(f.Name(), compressSuffix) {
-				compress = append(compress, f)
-			}
-		}
-	}
-
-	for _, f := range remove {
-		errRemove := os.Remove(filepath.Join(l.dir(), f.Name()))
-		if err == nil && errRemove != nil {
-			err = errRemove
-		}
-	}
-	for _, f := range compress {
-		fn := filepath.Join(l.dir(), f.Name())
-		errCompress := compressLogFile(fn, fn+compressSuffix)
-		if err == nil && errCompress != nil {
-			err = errCompress
-		}
+		l.postData.newFileName = ""
+		l.postData.newFileSize = 0
+		l.postData.db = ""
+		l.postData.tb = ""
+		l.postData.date = ""
+		l.postData.idx = -1
+		l.postData.newFilePosBegin = 0
+		l.postData.newFilePosEnd = 0
 	}
 
 	return err
@@ -388,8 +627,9 @@ func (l *Logger) millRunOnce() error {
 // of old log files.
 func (l *Logger) millRun() {
 	for _ = range l.millCh {
+		//		log.Info("here millRun, v: %b", v)
 		// what am I going to do, log this?
-		_ = l.millRunOnce()
+		_ = l.millRunOnceV2()
 	}
 }
 
@@ -397,9 +637,13 @@ func (l *Logger) millRun() {
 // starting the mill goroutine if necessary.
 func (l *Logger) mill() {
 	l.startMill.Do(func() {
+		//		log.Infof("mill")
 		l.millCh = make(chan bool, 1)
+		//		l.millCh = make(chan bool)
 		go l.millRun()
 	})
+
+	//	log.Info("mill select")
 	select {
 	case l.millCh <- true:
 	default:
@@ -421,11 +665,12 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 		if f.IsDir() {
 			continue
 		}
-		if t, err := l.timeFromName(f.Name(), prefix, ext); err == nil {
+		//		if t, err := l.timeFromName(f.Name(), prefix, ext); err == nil {
+		if t, err := l.timeFromStat(filepath.Join(l.dir(), f.Name()), prefix, ext); err == nil {
 			logFiles = append(logFiles, logInfo{t, f})
 			continue
 		}
-		if t, err := l.timeFromName(f.Name(), prefix, ext+compressSuffix); err == nil {
+		if t, err := l.timeFromStat(filepath.Join(l.dir(), f.Name()), prefix, ext+compressSuffix); err == nil {
 			logFiles = append(logFiles, logInfo{t, f})
 			continue
 		}
@@ -450,6 +695,23 @@ func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 	}
 	ts := filename[len(prefix) : len(filename)-len(ext)]
 	return time.Parse(backupTimeFormat, ts)
+}
+
+// timeFromStat extracts the file modified time from os_stat.
+func (l *Logger) timeFromStat(filename, prefix, ext string) (time.Time, error) {
+	if !strings.HasPrefix(filepath.Base(filename), prefix) {
+		return time.Time{}, errors.New("mismatched prefix")
+	}
+	if !strings.HasSuffix(filename, ext) {
+		return time.Time{}, errors.New("mismatched extension")
+	}
+
+	info, err := os_Stat(filename)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	return info.ModTime(), nil
 }
 
 // max returns the maximum size in bytes of log files before rolling.
@@ -484,18 +746,54 @@ func (l *Logger) dir() string {
 	return filepath.Dir(l.filename())
 }
 
+func (l *Logger) FileStartWriteDate() *time.Time {
+	return l.date
+}
+
+func (l *Logger) SetFileStartWriteDate(date *time.Time) {
+	if date != nil {
+		l.date = date
+	} else {
+		l.date = getNowFormDate(DATEFORMAT)
+	}
+}
+
 // prefixAndExt returns the filename part and extension part from the Logger's
 // filename.
 func (l *Logger) prefixAndExt() (prefix, ext string) {
 	filename := filepath.Base(l.filename())
 	ext = filepath.Ext(filename)
-	prefix = filename[:len(filename)-len(ext)] + "-"
+	//	prefix = filename[:len(filename)-len(ext)] + "-"
+	prefix = filename[:len(filename)-len(ext)]
 	return prefix, ext
+}
+
+// CurrentFileInfo returns the file info.
+func (l *Logger) CurrentFileInfo() os.FileInfo {
+	fileName := l.filename()
+	info, err := os.Stat(fileName)
+	if err != nil {
+		return nil
+	}
+
+	return info
+}
+
+func (l *Logger) GetLastRotateTime() time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastRotateTime
+}
+
+func (l *Logger) SetLastRotateTime(time time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lastRotateTime = time
 }
 
 // compressLogFile compresses the given log file, removing the
 // uncompressed log file if successful.
-func compressLogFile(src, dst string) (err error) {
+func CompressLogFile(src, dst string) (err error) {
 	f, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %v", err)
@@ -507,13 +805,15 @@ func compressLogFile(src, dst string) (err error) {
 		return fmt.Errorf("failed to stat log file: %v", err)
 	}
 
-	if err := chown(dst, fi); err != nil {
+	// 这里为了解决并发问题，将dst重命名为tmp后缀
+	dstTmp := dst + ".tmp"
+	if err := chown(dstTmp, fi); err != nil {
 		return fmt.Errorf("failed to chown compressed log file: %v", err)
 	}
 
 	// If this file already exists, we presume it was created by
 	// a previous attempt to compress the log file.
-	gzf, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
+	gzf, err := os.OpenFile(dstTmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
 	if err != nil {
 		return fmt.Errorf("failed to open compressed log file: %v", err)
 	}
@@ -523,8 +823,11 @@ func compressLogFile(src, dst string) (err error) {
 
 	defer func() {
 		if err != nil {
-			os.Remove(dst)
-			err = fmt.Errorf("failed to compress log file: %v", err)
+			if e := os.Remove(dstTmp); e != nil {
+				err = fmt.Errorf("err: %v, remove dst tmp file: %s err: %v", err, dstTmp, e)
+				return
+			}
+			err = fmt.Errorf("failed to compress log file: %s: err: %v", src, err)
 		}
 	}()
 
@@ -545,7 +848,101 @@ func compressLogFile(src, dst string) (err error) {
 		return err
 	}
 
+	// 重命名回来
+	if err = os.Rename(dstTmp, dst); err != nil {
+		return err
+	}
+
+	if err = os.Chmod(dst, fi.Mode()); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// unCompressLogFile uncompresses the given file, removing the
+// compressed file if successful.
+func UnCompressFile(src, dst string) (err error) {
+	f, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %v", err)
+	}
+	defer f.Close()
+
+	fi, err := os_Stat(src)
+	if err != nil {
+		return fmt.Errorf("failed to stat file: %v", err)
+	}
+
+	// 这里为了解决并发问题，将dst重命名为tmp后缀
+	dstTmp := dst + ".tmp"
+	if err := chown(dstTmp, fi); err != nil {
+		return fmt.Errorf("failed to chown uncompressed file: %v", err)
+	}
+
+	// If this file already exists, we presume it was created by
+	// a previous attempt to uncompress the file.
+	ungzf, err := os.OpenFile(dstTmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
+	if err != nil {
+		return fmt.Errorf("failed to open uncompressed file: %v", err)
+	}
+	defer ungzf.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("failed to new gzip reader: %v", err)
+	}
+
+	defer func() {
+		if err != nil {
+			if e := os.Remove(dstTmp); e != nil {
+				err = fmt.Errorf("err: %v, remove dstTmp file: %s fail: %v", err, dstTmp, e)
+			} else {
+				err = fmt.Errorf("fail to uncompress file: %s, err: %v", src, err)
+			}
+		}
+	}()
+
+	if _, err = io.Copy(ungzf, gz); err != nil {
+		return err
+	}
+	if err = gz.Close(); err != nil {
+		return err
+	}
+	if err = ungzf.Close(); err != nil {
+		return err
+	}
+
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = os.Remove(src); err != nil {
+		return err
+	}
+	// 重命名回来
+	if err = os.Rename(dstTmp, dst); err != nil {
+		return err
+	}
+
+	// Rename 后不需要再更新权限
+	// if err = os.Chmod(dst, fi.Mode()); err != nil {
+	// 	return err
+	// }
+
+	//log.Debugf("uncompress file: %s success, tmp: %s to dst: %s", src, dstTmp, dst)
+
+	return nil
+}
+
+//获取当前指定格式的日期
+func getNowFormDate(form string) *time.Time {
+	t, err := time.Parse(form, currentTime().Format(form))
+	if nil != err {
+		t = time.Time{}
+		return &t
+	}
+
+	return &t
 }
 
 // logInfo is a convenience struct to return the filename and its embedded
@@ -570,49 +967,79 @@ func (b byFormatTime) Len() int {
 	return len(b)
 }
 
-
-func (l *Logger) SetFileStartWriteDate(date *time.Time) {
-	if date != nil {
-		l.date = date
-	} else {
-		l.date = getNowFormDate(DATEFORMAT)
-	}
+type fileMetaInfo struct {
+	date  string
+	index int
+	db    string
+	tb    string
 }
 
-func (l *Logger) SetLastRotateTime(time time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.lastRotateTime = time
+// 获取表中某条记录
+func getFileMetaInfo(dbStr, tbStr string) (*fileMetaInfo, error) {
+	var (
+		fmi fileMetaInfo
+	)
+	fmi.db = dbStr
+	fmi.tb = tbStr
+
+	err = db.QueryRow("SELECT date, idx FROM t_binlog_file_status WHERE db = ? AND tb = ?;", dbStr, tbStr).Scan(&fmi.date, &fmi.index)
+
+	return &fmi, err
 }
 
-//获取当前指定格式的日期
-func getNowFormDate(form string) *time.Time {
-	t, err := time.Parse(form, currentTime().Format(form))
-	if nil != err {
-		t = time.Time{}
-		return &t
-	}
-
-	return &t
-}
-
-func (l *Logger) GetLastRotateTime() time.Time {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.lastRotateTime
-}
-
-func (l *Logger) FileStartWriteDate() *time.Time {
-	return l.date
-}
-
-// CurrentFileInfo returns the file info.
-func (l *Logger) CurrentFileInfo() os.FileInfo {
-	fileName := l.filename()
-	info, err := os.Stat(fileName)
+// 获取表中所有记录
+func getFileMetaInfos() (fmis []*fileMetaInfo, err error) {
+	var (
+		rows *sql.Rows
+	)
+	rows, err = db.Query("SELECT date, idx, db, tb FROM t_binlog_file_status;")
 	if err != nil {
-		return nil
+		return fmis, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var fmi fileMetaInfo
+		err = rows.Scan(&fmi.date, &fmi.index, &fmi.db, &fmi.tb)
+		if err != nil {
+			//log.Printf("scan rows err: %v", err)
+			continue
+		}
+		fmis = append(fmis, &fmi)
+	}
+	err = rows.Err()
+
+	return fmis, err
+}
+
+func insertFileMetaInfo(name, date string, index int, dbStr, tbStr string) error {
+	sql := "INSERT INTO t_binlog_file_status(file_name, date, idx, db, tb, create_time, modify_time) " +
+		"VALUES(?,?,?,?,?,?,?)"
+	t := currentTime().Format(normalTimeFormate)
+	_, err := db.Exec(sql, name, date, index, dbStr, tbStr, t, t)
+	if err != nil {
+		return err
 	}
 
-	return info
+	return nil
+}
+
+//更新表中某条记录
+func updateFileMetaInfo(date string, index int, dbStr, tbStr string) error {
+	sql := "UPDATE t_binlog_file_status SET " +
+		"date = ?," +
+		"idx = ?," +
+		"modify_time = ?" +
+		" WHERE db = ? AND tb = ?;"
+
+	result, err := db.Exec(sql, date, strconv.FormatInt(int64(index), 10), time.Now().Format(normalTimeFormate), dbStr, tbStr)
+	if err != nil {
+		return err
+	}
+
+	if afrs, err := result.RowsAffected(); err != nil || afrs <= 0 {
+		return fmt.Errorf("update file info err: %v . Or affect rows is 0", err)
+	}
+
+	return nil
 }
